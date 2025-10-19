@@ -28,7 +28,8 @@ class OpenAQCollector:
     
     def get_city_air_quality_data(self, city: str, country_code: str, 
                                 date_from: str, date_to: str, 
-                                limit: int = 100) -> pd.DataFrame:
+                                limit: int = 100,
+                                verbose: bool = False) -> pd.DataFrame:
         """Get air quality data for a city and date range"""
         
         all_measurements_data = []
@@ -39,7 +40,13 @@ class OpenAQCollector:
             # Get all locations in the country
             locations_response = self.client.locations.list(iso=country_code, limit=limit)
             all_country_locations = locations_response.results
-            
+            all_country_locations_df = pd.DataFrame(all_country_locations)
+            if verbose:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"all_country_locations_{timestamp}.csv"
+                all_country_locations_df.to_csv(filename, index=False)
+    
+                print("Try for recent data")
             # Filter locations by city name
             locations = []
             sensor_locations=[]
@@ -71,17 +78,25 @@ class OpenAQCollector:
             for location in locations:
                 location_id = getattr(location, 'id', None)
                 location_name = getattr(location, 'name', 'Unknown')
+                # Extract coordinates from location
+                coordinates = getattr(location, 'coordinates', {})
+                latitude = getattr(coordinates, 'latitude', None) if hasattr(coordinates, 'latitude') else None
+                longitude = getattr(coordinates, 'longitude', None) if hasattr(coordinates, 'longitude') else None
+                
                 print(location_name," has ",len(getattr(location, 'sensors', [])))
                 for i, sensor in enumerate(getattr(location, 'sensors', [])):
                     parameter_obj = getattr(sensor, 'parameter', None)
                     param_name = getattr(parameter_obj, 'name', None) if parameter_obj else None
-                    print("measured",param_name, "station id ",getattr(sensor, 'id', None))
+                    if verbose:
+                        print("measured",param_name, "station id ",getattr(sensor, 'id', None))
                     if param_name:
                         sensor_details.append({
                             'sensor_id': getattr(sensor, 'id', None),
                             'parameter': param_name,
                             'location_id': location_id,
-                            'location_name': location_name
+                            'location_name': location_name,
+                            'latitude': latitude,
+                            'longitude': longitude
                         })
                     if (i + 1) % 5 == 0 and (i + 1) < len(getattr(location, 'sensors', [])):
                         print("Taking a brief pause...")
@@ -95,40 +110,80 @@ class OpenAQCollector:
 
             for i, sensor_id in enumerate(unique_sensor_ids):
                 details = sensor_map[sensor_id]
-                print(f"Processing sensor {i + 1} of {len(unique_sensor_ids)}: {details['location_name']} (ID: {sensor_id})")
+                if verbose:
+                    print(f"Processing sensor {i + 1} of {len(unique_sensor_ids)}: {details['location_name']} (ID: {sensor_id})")
                 if (i + 1) % 5 == 0 and (i + 1) < len(unique_sensor_ids):
                     print("Taking a brief pause...")
                     time.sleep(5)  # Sleep for 1 second after every 5 sensors
 
-                measurements_response = self.client.measurements.list(
-                    sensors_id=sensor_id, 
-                    datetime_from=date_from,
-                    datetime_to=date_to,
-                    limit=limit
-                )
+                page = 1
+                total_retrieved = 0
+                MAX_PAGES = 1000 # Safety limit for very large queries
+                empty_pages=0
+                while page <= MAX_PAGES:
+                    try:
+                        measurements_response = self.client.measurements.list(
+                            sensors_id=sensor_id,  
+                            datetime_from=date_from,
+                            datetime_to=date_to,
+                            limit=limit, # max 1000
+                            page=page    # Increment page number
+                        )
+                        
+                       
+                        current_page_count = len(measurements_response.results)
+                        total_retrieved += current_page_count
+                        
+                        print(f"   -> Page {page}: Fetched {current_page_count} records.")
+                        if current_page_count==0:
+                            empty_pages+=1
+                        if (empty_pages >3):
+                            recent_data=self.client.locations.latest(sensor_id)
+                            all_recent_data = recent_data.results
+                            all_recent_data_df = pd.DataFrame(all_recent_data)
+                            if verbose:
+                                all_recent_data_df.to_csv(f"all_recent_data_{city}_{sensor_id}_.csv", index=False)
+               
+                            break
+
+                        #if not measurements_response.results:
+                        #    # No more results, break the inner loop
+                        #    break
+                        
+                        for measurement_obj in measurements_response.results:
+                            
+                            if hasattr(measurement_obj, 'dict'):
+                                measurement = measurement_obj.dict()  
+                            else:
+                                measurement = vars(measurement_obj).copy()
+                            
+                            # Extract datetime
+                            datetime_local_str = getattr(measurement_obj, 'datetime_local', None)
+                            
+                            measurement['datetime_local'] = datetime_local_str
+                            
+                            # Add metadata including coordinates
+                            measurement['location_id'] = details['location_id']
+                            measurement['location_name'] = details['location_name']
+                            measurement['sensor_id'] = sensor_id
+                            measurement['latitude'] = details['latitude']
+                            measurement['longitude'] = details['longitude']
+                            
+                            all_measurements_data.append(measurement)
+                        
+                        page += 1
+                        # Small pause after each page request
+                        time.sleep(1) 
+
+                    except Exception as e:
+                        print(f"Error fetching measurements for sensor {sensor_id} on page {page}: {e}")
+                        break
                 
-                for measurement_obj in measurements_response.results:
-                    if hasattr(measurement_obj, 'dict'):
-                        measurement = measurement_obj.dict() 
-                    else:
-                        measurement = vars(measurement_obj).copy()
-                    
-                    # Extract datetime
-                    datetime_local_str = None
-                    if hasattr(measurement_obj, 'datetime_local') and getattr(measurement_obj, 'datetime_local'):
-                        datetime_local_str = getattr(measurement_obj, 'datetime_local')
-                    
-                    measurement['datetime_local'] = datetime_local_str
-                    
-                    # Add metadata
-                    measurement['location_id'] = details['location_id']
-                    measurement['location_name'] = details['location_name']
-                    measurement['sensor_id'] = sensor_id
-                    
-                    all_measurements_data.append(measurement)
+                if verbose:
+                    print(f"Processed sensor {sensor_id} with a total of {total_retrieved} records.")
 
-            print(f"Retrieved {len(all_measurements_data)} measurements")
-
+            print(f"Retrieved {len(all_measurements_data)} total measurements")
+            
             # Create and clean dataframe
             if not all_measurements_data:
                 print("No measurements found")
@@ -165,7 +220,7 @@ class OpenAQCollector:
             )
             
             measurements_df['param_name'] = measurements_df['parameter'].apply(
-                lambda dt_obj: dt_obj.id if hasattr(dt_obj, 'id') else None
+                lambda dt_obj: dt_obj.name if hasattr(dt_obj, 'name') else None
             )
             
             measurements_df['unit'] = measurements_df['parameter'].apply(
@@ -186,8 +241,8 @@ class OpenAQCollector:
             )
             measurements_df['data_gap'] = measurements_df['expected_count'] - measurements_df['observed_count']
             
-            # Select final columns
-            final_cols = ['datetime_from','datetime_to', 'location_id','sensor_id', 'param_id', 'param_name' , 'value', 'unit']
+            # Select final columns - added latitude and longitude
+            final_cols = ['datetime_from','datetime_to', 'location_id',"location_name",'sensor_id', 'param_id', 'param_name' , 'value', 'unit', 'latitude', 'longitude']
             
             final_df = measurements_df[final_cols]
             
